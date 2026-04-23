@@ -1,0 +1,1884 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="ar" dir="rtl"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>فرصتك - عروض وخصومات حصرية</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&amp;family=Tajawal:wght@400;500;700;900&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --red: #E63946;
+    --red-dark: #C1121F;
+    --red-light: #ff6b6b;
+    --gold: #FFB703;
+    --gold-dark: #e0a000;
+    --black: #1D1D1D;
+    --gray-dark: #2d2d2d;
+    --gray: #6b6b6b;
+    --gray-light: #F5F5F5;
+    --white: #FFFFFF;
+    --green: #2ecc71;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Cairo', sans-serif;
+    background: var(--white);
+    color: var(--black);
+    overflow-x: hidden;
+  }
+
+  /* ===== NAVBAR ===== */
+  nav {
+    background: var(--black);
+    padding: 0 5%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 70px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    box-shadow: 0 2px 20px rgba(230,57,70,0.3);
+  }
+
+  .logo {
+    font-family: 'Tajawal', sans-serif;
+    font-size: 28px;
+    font-weight: 900;
+    color: var(--white);
+    letter-spacing: -1px;
+  }
+
+  .logo span { color: var(--gold); }
+
+  .nav-links {
+    display: flex;
+    gap: 30px;
+    list-style: none;
+  }
+
+  .nav-links a {
+    color: #ccc;
+    text-decoration: none;
+    font-size: 15px;
+    font-weight: 600;
+    transition: color 0.2s;
+  }
+
+  .nav-links a:hover { color: var(--gold); }
+
+  .nav-btns {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+
+  .btn-login {
+    background: transparent;
+    border: 2px solid var(--red);
+    color: var(--white);
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-login:hover { background: var(--red); }
+
+  .btn-register {
+    background: var(--red);
+    border: none;
+    color: var(--white);
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-register:hover { background: var(--red-dark); }
+
+  /* My Coupons Nav Button */
+  .btn-my-coupons {
+    background: rgba(255,183,3,0.15);
+    border: 2px solid var(--gold);
+    color: var(--gold);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: none;
+  }
+  .btn-my-coupons:hover { background: var(--gold); color: var(--black); }
+  .btn-my-coupons.visible { display: inline-flex; align-items: center; gap: 6px; }
+
+  /* ===== HERO ===== */
+  .hero {
+    background: linear-gradient(135deg, var(--black) 0%, #2a0a0d 50%, var(--red-dark) 100%);
+    padding: 80px 5% 60px;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -20%;
+    width: 600px;
+    height: 600px;
+    background: radial-gradient(circle, rgba(230,57,70,0.2) 0%, transparent 70%);
+    animation: pulse 4s ease-in-out infinite;
+  }
+
+  .hero::after {
+    content: '';
+    position: absolute;
+    bottom: -30%;
+    right: -10%;
+    width: 400px;
+    height: 400px;
+    background: radial-gradient(circle, rgba(255,183,3,0.15) 0%, transparent 70%);
+    animation: pulse 4s ease-in-out infinite reverse;
+  }
+
+  @keyframes pulse {
+    0%, 100% { transform: scale(1); opacity: 0.5; }
+    50% { transform: scale(1.2); opacity: 1; }
+  }
+
+  .hero-badge {
+    display: inline-block;
+    background: var(--gold);
+    color: var(--black);
+    padding: 6px 18px;
+    border-radius: 50px;
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 20px;
+    animation: fadeDown 0.6s ease;
+  }
+
+  .hero h1 {
+    font-family: 'Tajawal', sans-serif;
+    font-size: clamp(36px, 6vw, 72px);
+    font-weight: 900;
+    color: var(--white);
+    line-height: 1.1;
+    margin-bottom: 20px;
+    animation: fadeDown 0.7s ease;
+  }
+
+  .hero h1 span { color: var(--gold); }
+
+  .hero p {
+    font-size: 18px;
+    color: rgba(255,255,255,0.75);
+    margin-bottom: 40px;
+    max-width: 600px;
+    margin-left: auto;
+    margin-right: auto;
+    animation: fadeDown 0.8s ease;
+  }
+
+  .hero-search {
+    display: flex;
+    max-width: 580px;
+    margin: 0 auto 40px;
+    background: white;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.3);
+    animation: fadeDown 0.9s ease;
+  }
+
+  .hero-search input {
+    flex: 1;
+    border: none;
+    padding: 18px 20px;
+    font-family: 'Cairo', sans-serif;
+    font-size: 16px;
+    outline: none;
+    background: transparent;
+    direction: rtl;
+  }
+
+  .hero-search button {
+    background: var(--red);
+    border: none;
+    padding: 18px 30px;
+    color: white;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 16px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .hero-search button:hover { background: var(--red-dark); }
+
+  .hero-stats {
+    display: flex;
+    justify-content: center;
+    gap: 50px;
+    animation: fadeDown 1s ease;
+  }
+
+  .stat { text-align: center; }
+
+  .stat-num {
+    font-family: 'Tajawal', sans-serif;
+    font-size: 32px;
+    font-weight: 900;
+    color: var(--gold);
+  }
+
+  .stat-label {
+    font-size: 13px;
+    color: rgba(255,255,255,0.6);
+    margin-top: 2px;
+  }
+
+  @keyframes fadeDown {
+    from { opacity: 0; transform: translateY(-20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ===== CATEGORIES ===== */
+  .section { padding: 60px 5%; }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 30px;
+  }
+
+  .section-title {
+    font-family: 'Tajawal', sans-serif;
+    font-size: 26px;
+    font-weight: 900;
+    color: var(--black);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .section-title::before {
+    content: '';
+    width: 5px;
+    height: 30px;
+    background: var(--red);
+    border-radius: 3px;
+    display: inline-block;
+  }
+
+  .see-all {
+    color: var(--red);
+    font-weight: 700;
+    font-size: 14px;
+    text-decoration: none;
+    border: 2px solid var(--red);
+    padding: 6px 16px;
+    border-radius: 8px;
+    transition: all 0.2s;
+  }
+
+  .see-all:hover { background: var(--red); color: white; }
+
+  .categories {
+    display: flex;
+    gap: 15px;
+    flex-wrap: wrap;
+  }
+
+  .cat-card {
+    background: var(--gray-light);
+    border-radius: 14px;
+    padding: 20px 24px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.25s;
+    flex: 1;
+    min-width: 120px;
+    border: 2px solid transparent;
+  }
+
+  .cat-card:hover, .cat-card.active {
+    background: var(--red);
+    border-color: var(--red);
+    transform: translateY(-4px);
+    box-shadow: 0 8px 25px rgba(230,57,70,0.3);
+  }
+
+  .cat-card:hover .cat-icon, .cat-card.active .cat-icon { filter: brightness(10); }
+  .cat-card:hover .cat-name, .cat-card.active .cat-name { color: white; }
+
+  .cat-icon { font-size: 30px; margin-bottom: 8px; }
+  .cat-name { font-size: 13px; font-weight: 700; color: var(--black); transition: color 0.2s; }
+
+  /* ===== DEALS GRID ===== */
+  .deals-section { background: var(--gray-light); }
+
+  .deals-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 20px;
+  }
+
+  .deal-card {
+    background: white;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 2px 15px rgba(0,0,0,0.07);
+    transition: all 0.3s;
+    cursor: pointer;
+    position: relative;
+  }
+
+  .deal-card:hover {
+    transform: translateY(-6px);
+    box-shadow: 0 15px 40px rgba(0,0,0,0.12);
+  }
+
+  .deal-img {
+    width: 100%;
+    height: 180px;
+    object-fit: cover;
+    background: linear-gradient(135deg, #f0f0f0, #e0e0e0);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 60px;
+    position: relative;
+  }
+
+  .deal-badge {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: var(--red);
+    color: white;
+    font-weight: 900;
+    font-size: 14px;
+    padding: 5px 12px;
+    border-radius: 50px;
+    font-family: 'Tajawal', sans-serif;
+  }
+
+  .deal-hot {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    background: var(--gold);
+    color: var(--black);
+    font-weight: 700;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 50px;
+  }
+
+  .deal-body { padding: 16px; }
+
+  .deal-category {
+    font-size: 12px;
+    color: var(--red);
+    font-weight: 700;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .deal-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--black);
+    margin-bottom: 4px;
+    line-height: 1.4;
+  }
+
+  .deal-location {
+    font-size: 13px;
+    color: var(--gray);
+    margin-bottom: 14px;
+  }
+
+  .deal-pricing {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 14px;
+    border-top: 1px solid #f0f0f0;
+  }
+
+  .price-new {
+    font-family: 'Tajawal', sans-serif;
+    font-size: 22px;
+    font-weight: 900;
+    color: var(--red);
+  }
+
+  .price-new span { font-size: 13px; font-weight: 600; }
+
+  .price-old {
+    font-size: 14px;
+    color: var(--gray);
+    text-decoration: line-through;
+  }
+
+  .btn-buy {
+    background: var(--red);
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 10px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-buy:hover { background: var(--red-dark); transform: scale(1.05); }
+
+  .deal-remaining {
+    font-size: 12px;
+    color: var(--gray);
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .remaining-bar {
+    flex: 1;
+    height: 4px;
+    background: #f0f0f0;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .remaining-fill {
+    height: 100%;
+    background: var(--gold);
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+
+  /* ===== HOW IT WORKS ===== */
+  .how-section {
+    background: var(--black);
+    padding: 70px 5%;
+    text-align: center;
+  }
+
+  .how-section .section-title {
+    color: white;
+    justify-content: center;
+    margin-bottom: 50px;
+  }
+
+  .how-section .section-title::before { background: var(--gold); }
+
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 30px;
+    max-width: 900px;
+    margin: 0 auto;
+  }
+
+  .step-num {
+    width: 60px;
+    height: 60px;
+    background: var(--red);
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Tajawal', sans-serif;
+    font-size: 24px;
+    font-weight: 900;
+    color: white;
+    margin: 0 auto 16px;
+    box-shadow: 0 4px 20px rgba(230,57,70,0.4);
+  }
+
+  .step-title { color: var(--gold); font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+  .step-desc { color: rgba(255,255,255,0.6); font-size: 14px; line-height: 1.6; }
+
+  /* ===== BANNER ===== */
+  .banner {
+    background: linear-gradient(135deg, var(--red) 0%, var(--red-dark) 100%);
+    padding: 60px 5%;
+    text-align: center;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .banner::before { content: '🎯'; position: absolute; font-size: 200px; opacity: 0.05; top: -30px; right: -30px; }
+  .banner h2 { font-family: 'Tajawal', sans-serif; font-size: 36px; font-weight: 900; color: white; margin-bottom: 12px; }
+  .banner p { color: rgba(255,255,255,0.85); font-size: 17px; margin-bottom: 30px; }
+
+  .banner-btns { display: flex; gap: 15px; justify-content: center; flex-wrap: wrap; }
+
+  .btn-white { background: white; color: var(--red); border: none; padding: 14px 35px; border-radius: 12px; font-family: 'Cairo', sans-serif; font-weight: 700; font-size: 16px; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+  .btn-white:hover { transform: translateY(-2px); }
+
+  .btn-outline-white { background: transparent; color: white; border: 2px solid rgba(255,255,255,0.7); padding: 14px 35px; border-radius: 12px; font-family: 'Cairo', sans-serif; font-weight: 700; font-size: 16px; cursor: pointer; transition: all 0.2s; }
+  .btn-outline-white:hover { border-color: white; background: rgba(255,255,255,0.1); }
+
+  /* ===== FOOTER ===== */
+  footer { background: #111; padding: 50px 5% 25px; color: rgba(255,255,255,0.6); }
+
+  .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 40px; margin-bottom: 40px; }
+
+  .footer-logo { font-family: 'Tajawal', sans-serif; font-size: 28px; font-weight: 900; color: white; margin-bottom: 12px; }
+  .footer-logo span { color: var(--gold); }
+  .footer-desc { font-size: 14px; line-height: 1.7; margin-bottom: 20px; }
+
+  .footer-social { display: flex; gap: 12px; }
+  .social-btn { width: 38px; height: 38px; background: rgba(255,255,255,0.1); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 16px; cursor: pointer; transition: background 0.2s; }
+  .social-btn:hover { background: var(--red); }
+
+  .footer-col h4 { color: white; font-weight: 700; font-size: 16px; margin-bottom: 16px; }
+  .footer-col ul { list-style: none; }
+  .footer-col ul li { margin-bottom: 10px; font-size: 14px; }
+  .footer-col ul li a { color: rgba(255,255,255,0.5); text-decoration: none; transition: color 0.2s; }
+  .footer-col ul li a:hover { color: var(--gold); }
+
+  .footer-bottom { border-top: 1px solid rgba(255,255,255,0.1); padding-top: 20px; text-align: center; font-size: 13px; }
+
+  /* ===== MODALS (BASE) ===== */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 1000;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: white;
+    border-radius: 20px;
+    padding: 40px;
+    width: 90%;
+    max-width: 420px;
+    position: relative;
+    animation: modalIn 0.3s ease;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+
+  @keyframes modalIn {
+    from { opacity: 0; transform: scale(0.9) translateY(20px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+
+  .modal-close {
+    position: absolute;
+    top: 15px;
+    left: 15px;
+    background: #f0f0f0;
+    border: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal h2 { font-family: 'Tajawal', sans-serif; font-size: 26px; font-weight: 900; margin-bottom: 6px; text-align: center; }
+  .modal-sub { text-align: center; color: var(--gray); font-size: 14px; margin-bottom: 28px; }
+
+  .form-group { margin-bottom: 18px; }
+  .form-group label { display: block; font-weight: 700; font-size: 14px; margin-bottom: 6px; color: var(--black); }
+  .form-group input {
+    width: 100%;
+    padding: 13px 16px;
+    border: 2px solid #e8e8e8;
+    border-radius: 10px;
+    font-family: 'Cairo', sans-serif;
+    font-size: 15px;
+    outline: none;
+    transition: border-color 0.2s;
+    direction: rtl;
+  }
+  .form-group input:focus { border-color: var(--red); }
+
+  .btn-submit { width: 100%; background: var(--red); color: white; border: none; padding: 15px; border-radius: 12px; font-family: 'Cairo', sans-serif; font-weight: 700; font-size: 17px; cursor: pointer; transition: background 0.2s; margin-top: 5px; }
+  .btn-submit:hover { background: var(--red-dark); }
+
+  .modal-switch { text-align: center; margin-top: 18px; font-size: 14px; color: var(--gray); }
+  .modal-switch a { color: var(--red); font-weight: 700; text-decoration: none; cursor: pointer; }
+
+  /* ===== PAYMENT MODAL ===== */
+  .pay-modal { max-width: 500px; }
+
+  .pay-steps {
+    display: flex;
+    justify-content: center;
+    gap: 0;
+    margin-bottom: 28px;
+  }
+
+  .pay-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1;
+    position: relative;
+  }
+
+  .pay-step:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    top: 16px;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: #e0e0e0;
+    z-index: 0;
+  }
+
+  .pay-step.done::after { background: var(--green); }
+  .pay-step.active::after { background: var(--red); }
+
+  .step-circle {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #e0e0e0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 700;
+    color: #999;
+    z-index: 1;
+    transition: all 0.3s;
+  }
+
+  .pay-step.active .step-circle { background: var(--red); color: white; }
+  .pay-step.done .step-circle { background: var(--green); color: white; }
+
+  .step-lbl { font-size: 11px; color: #999; margin-top: 5px; font-weight: 600; }
+  .pay-step.active .step-lbl { color: var(--red); }
+  .pay-step.done .step-lbl { color: var(--green); }
+
+  .pay-content { display: none; }
+  .pay-content.active { display: block; }
+
+  /* Deal Summary Box */
+  .deal-summary {
+    background: var(--gray-light);
+    border-radius: 14px;
+    padding: 18px;
+    margin-bottom: 22px;
+    display: flex;
+    gap: 14px;
+    align-items: center;
+  }
+
+  .deal-summary-icon { font-size: 44px; }
+
+  .deal-summary-info h3 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  .deal-summary-info .price-row { display: flex; gap: 10px; align-items: center; }
+  .deal-summary-info .new-p { font-family: 'Tajawal', sans-serif; font-size: 22px; font-weight: 900; color: var(--red); }
+  .deal-summary-info .old-p { font-size: 13px; color: var(--gray); text-decoration: line-through; }
+  .deal-summary-info .save-p { font-size: 12px; background: rgba(46,204,113,0.15); color: var(--green); padding: 3px 8px; border-radius: 20px; font-weight: 700; }
+
+  /* Payment methods */
+  .pay-methods { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }
+
+  .pay-method {
+    border: 2px solid #e8e8e8;
+    border-radius: 12px;
+    padding: 16px 12px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .pay-method:hover { border-color: var(--red); background: rgba(230,57,70,0.03); }
+  .pay-method.selected { border-color: var(--red); background: rgba(230,57,70,0.06); }
+
+  .pay-method-icon { font-size: 28px; margin-bottom: 6px; }
+  .pay-method-name { font-size: 13px; font-weight: 700; }
+
+  .pay-total {
+    background: var(--black);
+    color: white;
+    border-radius: 12px;
+    padding: 16px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .pay-total .label { font-size: 14px; color: rgba(255,255,255,0.7); }
+  .pay-total .amount { font-family: 'Tajawal', sans-serif; font-size: 26px; font-weight: 900; color: var(--gold); }
+
+  /* Coupon Result */
+  .coupon-result {
+    text-align: center;
+    padding: 10px 0;
+  }
+
+  .coupon-icon { font-size: 64px; margin-bottom: 16px; animation: bounceIn 0.6s ease; }
+
+  @keyframes bounceIn {
+    0% { transform: scale(0); }
+    60% { transform: scale(1.2); }
+    100% { transform: scale(1); }
+  }
+
+  .coupon-result h3 { font-family: 'Tajawal', sans-serif; font-size: 22px; font-weight: 900; margin-bottom: 6px; color: var(--black); }
+  .coupon-result p { font-size: 14px; color: var(--gray); margin-bottom: 20px; }
+
+  .coupon-code-box {
+    background: linear-gradient(135deg, var(--black) 0%, #2a0a0d 100%);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .coupon-code-box::before {
+    content: '🎫';
+    position: absolute;
+    font-size: 120px;
+    opacity: 0.05;
+    right: -20px;
+    top: -20px;
+  }
+
+  .coupon-label { font-size: 12px; color: rgba(255,255,255,0.5); margin-bottom: 8px; letter-spacing: 2px; text-transform: uppercase; }
+  .coupon-code { font-family: monospace; font-size: 28px; font-weight: 900; color: var(--gold); letter-spacing: 3px; margin-bottom: 8px; }
+  .coupon-deal-name { font-size: 14px; color: rgba(255,255,255,0.7); }
+
+  .coupon-expiry {
+    display: flex;
+    justify-content: space-between;
+    background: rgba(255,255,255,0.06);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-top: 10px;
+  }
+
+  .coupon-expiry span { font-size: 12px; color: rgba(255,255,255,0.5); }
+  .coupon-expiry strong { font-size: 12px; color: var(--gold); }
+
+  .btn-copy-code {
+    width: 100%;
+    background: var(--gold);
+    color: var(--black);
+    border: none;
+    padding: 14px;
+    border-radius: 12px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 16px;
+    cursor: pointer;
+    transition: all 0.2s;
+    margin-bottom: 10px;
+  }
+
+  .btn-copy-code:hover { background: var(--gold-dark); transform: scale(1.02); }
+
+  .btn-view-all-coupons {
+    width: 100%;
+    background: transparent;
+    border: 2px solid var(--black);
+    color: var(--black);
+    padding: 12px;
+    border-radius: 12px;
+    font-family: 'Cairo', sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .btn-view-all-coupons:hover { background: var(--black); color: white; }
+
+  /* ===== MY COUPONS MODAL ===== */
+  .my-coupons-modal { max-width: 540px; }
+
+  .my-coupon-item {
+    border: 1.5px solid #e8e8e8;
+    border-radius: 14px;
+    overflow: hidden;
+    margin-bottom: 14px;
+    transition: box-shadow 0.2s;
+  }
+
+  .my-coupon-item:hover { box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+
+  .my-coupon-header {
+    background: linear-gradient(135deg, var(--black), #2a0a0d);
+    padding: 14px 18px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .my-coupon-code { font-family: monospace; font-size: 18px; font-weight: 900; color: var(--gold); letter-spacing: 2px; }
+
+  .my-coupon-status {
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .status-valid { background: rgba(46,204,113,0.2); color: var(--green); }
+  .status-used { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.4); }
+
+  .my-coupon-body { padding: 14px 18px; }
+  .my-coupon-title { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+
+  .my-coupon-meta { display: flex; gap: 16px; }
+  .my-coupon-meta span { font-size: 12px; color: var(--gray); }
+
+  .empty-coupons { text-align: center; padding: 40px 20px; color: var(--gray); }
+  .empty-coupons .empty-icon { font-size: 50px; margin-bottom: 12px; }
+  .empty-coupons p { font-size: 15px; }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 30px;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: var(--black);
+    color: white;
+    padding: 14px 28px;
+    border-radius: 50px;
+    font-weight: 600;
+    font-size: 15px;
+    z-index: 9999;
+    transition: transform 0.3s ease;
+    border-right: 4px solid var(--gold);
+  }
+
+  .toast.show { transform: translateX(-50%) translateY(0); }
+
+  @media (max-width: 768px) {
+    .nav-links { display: none; }
+    .hero-stats { gap: 25px; }
+    .footer-grid { grid-template-columns: 1fr 1fr; }
+    .deals-grid { grid-template-columns: 1fr 1fr; }
+    .steps { grid-template-columns: 1fr 1fr; }
+  }
+
+  @media (max-width: 480px) {
+    .deals-grid { grid-template-columns: 1fr; }
+    .footer-grid { grid-template-columns: 1fr; }
+    .steps { grid-template-columns: 1fr; }
+    .pay-methods { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- NAVBAR -->
+<nav>
+  <div class="logo">فرصت<span>ك</span></div>
+  <ul class="nav-links">
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">الرئيسية</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">مطاعم وكافيهات</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">ترفيه</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">صحة وجمال</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">فنادق</a></li>
+  </ul>
+  <div class="nav-btns">
+    <button class="btn-my-coupons" id="btnMyCoupons" onclick="openMyCoupons()">🎟️ كوباناتي</button>
+    <button class="btn-login" id="btnLogin" onclick="openModal(&#39;login&#39;)">تسجيل دخول</button>
+    <button class="btn-register" id="btnRegister" onclick="openModal(&#39;register&#39;)">انشئ حساب</button>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-badge">🔥 أكتر من 500 عرض حصري في مصر</div>
+  <h1>كل يوم فيه<br><span>فرصتك!</span></h1>
+  <p>خصومات تصل لـ 70% على أفضل المطاعم والكافيهات وأماكن الترفيه في مصر</p>
+  <div class="hero-search">
+    <input type="text" id="searchInput" placeholder="ابحث عن عرض، مطعم، أو خدمة..." oninput="filterDeals()">
+    <button>🔍 ابحث</button>
+  </div>
+  <div class="hero-stats">
+    <div class="stat">
+      <div class="stat-num">+500</div>
+      <div class="stat-label">عرض حصري</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num">+200</div>
+      <div class="stat-label">متجر وشريك</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num">70%</div>
+      <div class="stat-label">أقصى خصم</div>
+    </div>
+    <div class="stat">
+      <div class="stat-num">+10K</div>
+      <div class="stat-label">عميل سعيد</div>
+    </div>
+  </div>
+</section>
+
+<!-- CATEGORIES -->
+<section class="section">
+  <div class="section-header">
+    <div class="section-title">تصفح التصنيفات</div>
+    <a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" class="see-all">كل التصنيفات</a>
+  </div>
+  <div class="categories">
+    <div class="cat-card active" onclick="filterCat(this, &#39;الكل&#39;)">
+      <div class="cat-icon">🛒</div>
+      <div class="cat-name">الكل</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;مطاعم&#39;)">
+      <div class="cat-icon">🍽️</div>
+      <div class="cat-name">مطاعم</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;كافيهات&#39;)">
+      <div class="cat-icon">☕</div>
+      <div class="cat-name">كافيهات</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;ترفيه&#39;)">
+      <div class="cat-icon">🎭</div>
+      <div class="cat-name">ترفيه</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;سبا وجمال&#39;)">
+      <div class="cat-icon">💆</div>
+      <div class="cat-name">سبا وجمال</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;فنادق&#39;)">
+      <div class="cat-icon">🏨</div>
+      <div class="cat-name">فنادق</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;ألعاب&#39;)">
+      <div class="cat-icon">🎮</div>
+      <div class="cat-name">ألعاب</div>
+    </div>
+    <div class="cat-card" onclick="filterCat(this, &#39;رياضة&#39;)">
+      <div class="cat-icon">🏋️</div>
+      <div class="cat-name">رياضة</div>
+    </div>
+  </div>
+</section>
+
+<!-- DEALS -->
+<section class="section deals-section">
+  <div class="section-header">
+    <div class="section-title">أحدث العروض 🔥</div>
+    <a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#" class="see-all">كل العروض</a>
+  </div>
+  <div class="deals-grid" id="dealsGrid"><p style="text-align:center;padding:40px;color:#888">جاري تحميل العروض...</p></div>
+  <div id="noDeals" style="display:none; text-align:center; padding:40px; color:var(--gray);">
+    <div style="font-size:50px; margin-bottom:12px">😕</div>
+    <p style="font-size:16px; font-weight:600">مفيش عروض في هذا التصنيف دلوقتي</p>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="how-section">
+  <div class="section-title" style="color:white; justify-content:center; margin-bottom:50px;">إزاي بتشتغل فرصتك؟</div>
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-title">اختار العرض</div>
+      <div class="step-desc">تصفح مئات العروض الحصرية واختار اللي يناسبك</div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-title">ادفع أونلاين</div>
+      <div class="step-desc">ادفع بأمان عن طريق فوري أو كارت أو محفظة</div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-title">استلم الكوبون</div>
+      <div class="step-desc">كوبونك هيظهر فوراً في حسابك جاهز للاستخدام</div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-title">استمتع بالخصم</div>
+      <div class="step-desc">سلّم الكوبون للتاجر واستمتع بالعرض 🎉</div>
+    </div>
+  </div>
+</section>
+
+<!-- BANNER CTA -->
+<section class="banner">
+  <h2>عندك متجر وعايز تنمي مبيعاتك؟</h2>
+  <p>انضم لأكتر من 200 تاجر بيستفيدوا من فرصتك وبيوصلوا لآلاف العملاء</p>
+  <div class="banner-btns">
+    <button class="btn-white">سجّل متجرك دلوقتي</button>
+    <button class="btn-outline-white">اعرف أكتر</button>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <div class="footer-grid">
+    <div>
+      <div class="footer-logo">فرصت<span>ك</span></div>
+      <div class="footer-desc">منصة العروض والخصومات الأولى في مصر. بنوفرلك أفضل الصفقات على المطاعم والترفيه والخدمات بأسعار مش هتلاقيها في أي مكان تاني.</div>
+      <div class="footer-social">
+        <div class="social-btn">📘</div>
+        <div class="social-btn">📸</div>
+        <div class="social-btn">🐦</div>
+        <div class="social-btn">▶️</div>
+      </div>
+    </div>
+    <div class="footer-col">
+      <h4>روابط سريعة</h4>
+      <ul>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">الرئيسية</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">كل العروض</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">التصنيفات</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">العروض الجديدة</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>للتجار</h4>
+      <ul>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">سجّل متجرك</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">كيف تعمل؟</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">تواصل معنا</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>المساعدة</h4>
+      <ul>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">الأسئلة الشائعة</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">سياسة الاسترجاع</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">الشروط والأحكام</a></li>
+        <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;parentOrigin=https%3A%2F%2Fclaude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#">اتصل بنا</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    جميع الحقوق محفوظة © 2025 فرصتك
+  </div>
+</footer>
+
+<!-- LOGIN MODAL -->
+<div class="modal-overlay" id="loginModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal(&#39;loginModal&#39;)">✕</button>
+    <h2>أهلاً بيك 👋</h2>
+    <p class="modal-sub">سجّل دخولك وابدأ في توفير فلوسك</p>
+    <div class="form-group">
+      <label>رقم الموبايل</label>
+      <input type="tel" id="loginPhone" placeholder="01xxxxxxxxx">
+    </div>
+    <div class="form-group">
+      <label>كلمة السر</label>
+      <input type="password" id="loginPass" placeholder="••••••••">
+    </div>
+    <button class="btn-submit" onclick="handleLogin()">تسجيل الدخول</button>
+    <div class="modal-switch">
+      مش عندك حساب؟ <a onclick="openModal(&#39;register&#39;)">انشئ حساب جديد</a>
+    </div>
+  </div>
+</div>
+
+<!-- REGISTER MODAL -->
+<div class="modal-overlay" id="registerModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal(&#39;registerModal&#39;)">✕</button>
+    <h2>انضم لفرصتك 🎉</h2>
+    <p class="modal-sub">انشئ حسابك وابدأ توفر فلوسك من النهارده</p>
+    <div class="form-group">
+      <label>الاسم الكامل</label>
+      <input type="text" id="regName" placeholder="اسمك هنا">
+    </div>
+    <div class="form-group">
+      <label>رقم الموبايل</label>
+      <input type="tel" id="regPhone" placeholder="01xxxxxxxxx">
+    </div>
+    <div class="form-group">
+      <label>كلمة السر</label>
+      <input type="password" id="regPass" placeholder="••••••••">
+    </div>
+    <button class="btn-submit" onclick="handleRegister()">انشئ حسابي</button>
+    <div class="modal-switch">
+      عندك حساب؟ <a onclick="openModal(&#39;login&#39;)">سجّل دخولك</a>
+    </div>
+  </div>
+</div>
+
+<!-- PAYMENT MODAL -->
+<div class="modal-overlay" id="payModal">
+  <div class="modal pay-modal">
+    <button class="modal-close" onclick="closeModal(&#39;payModal&#39;)">✕</button>
+
+    <!-- Steps Indicator -->
+    <div class="pay-steps">
+      <div class="pay-step active" id="pstep1">
+        <div class="step-circle">1</div>
+        <div class="step-lbl">المراجعة</div>
+      </div>
+      <div class="pay-step" id="pstep2">
+        <div class="step-circle">2</div>
+        <div class="step-lbl">الدفع</div>
+      </div>
+      <div class="pay-step" id="pstep3">
+        <div class="step-circle">3</div>
+        <div class="step-lbl">الكوبون</div>
+      </div>
+    </div>
+
+    <!-- Step 1: Review -->
+    <div class="pay-content active" id="payStep1">
+      <h2 style="text-align:center; font-size:20px; margin-bottom:20px;">🛒 مراجعة الطلب</h2>
+      <div class="deal-summary" id="dealSummaryBox"></div>
+      <div style="background:#fff8e1; border-radius:12px; padding:14px 16px; margin-bottom:18px; font-size:13px; color:#7a5c00; border: 1px solid #ffe082;">
+        ⏰ <strong>تنبيه:</strong> الكوبون صالح لمدة 30 يوم من تاريخ الشراء
+      </div>
+      <button class="btn-submit" onclick="goToPayStep(2)">متابعة للدفع ←</button>
+    </div>
+
+    <!-- Step 2: Payment -->
+    <div class="pay-content" id="payStep2">
+      <h2 style="text-align:center; font-size:20px; margin-bottom:20px;">💳 اختار طريقة الدفع</h2>
+      <div class="pay-methods">
+        <div class="pay-method selected" onclick="selectMethod(this)" data-method="فوري">
+          <div class="pay-method-icon">💸</div>
+          <div class="pay-method-name">فوري</div>
+        </div>
+        <div class="pay-method" onclick="selectMethod(this)" data-method="فيزا / ماستر كارد">
+          <div class="pay-method-icon">💳</div>
+          <div class="pay-method-name">فيزا / ماستر</div>
+        </div>
+        <div class="pay-method" onclick="selectMethod(this)" data-method="فودافون كاش">
+          <div class="pay-method-icon">📱</div>
+          <div class="pay-method-name">فودافون كاش</div>
+        </div>
+        <div class="pay-method" onclick="selectMethod(this)" data-method="إنستاباي">
+          <div class="pay-method-icon">🏦</div>
+          <div class="pay-method-name">إنستاباي</div>
+        </div>
+      </div>
+
+      <div id="cardFields" style="display:none; margin-bottom:16px;">
+        <div class="form-group">
+          <label>رقم الكارت</label>
+          <input type="text" placeholder="XXXX XXXX XXXX XXXX" maxlength="19" dir="ltr" style="letter-spacing:2px;">
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+          <div class="form-group">
+            <label>تاريخ الانتهاء</label>
+            <input type="text" placeholder="MM/YY" maxlength="5" dir="ltr">
+          </div>
+          <div class="form-group">
+            <label>CVV</label>
+            <input type="text" placeholder="•••" maxlength="3" dir="ltr">
+          </div>
+        </div>
+      </div>
+
+      <div class="pay-total">
+        <span class="label">إجمالي المبلغ</span>
+        <span class="amount" id="payTotalAmount">— جنيه</span>
+      </div>
+
+      <button class="btn-submit" onclick="processPayment()" id="btnPay">✅ ادفع دلوقتي</button>
+      <button onclick="goToPayStep(1)" style="width:100%; margin-top:8px; background:none; border:none; color:var(--gray); font-family:&#39;Cairo&#39;,sans-serif; font-size:14px; cursor:pointer;">← رجوع</button>
+    </div>
+
+    <!-- Step 3: Coupon -->
+    <div class="pay-content" id="payStep3">
+      <div class="coupon-result">
+        <div class="coupon-icon">🎉</div>
+        <h3>تم الشراء بنجاح!</h3>
+        <p>الكوبون اتضاف لحسابك وجاهز للاستخدام</p>
+        <div class="coupon-code-box" id="couponCodeBox">
+          <div class="coupon-label">كود الكوبون</div>
+          <div class="coupon-code" id="generatedCode">FSK-0000-XX</div>
+          <div class="coupon-deal-name" id="couponDealName"></div>
+          <div class="coupon-expiry">
+            <span>تاريخ الشراء</span>
+            <strong id="couponBuyDate"></strong>
+          </div>
+          <div class="coupon-expiry">
+            <span>صالح حتى</span>
+            <strong id="couponExpiry"></strong>
+          </div>
+        </div>
+        <button class="btn-copy-code" onclick="copyCode()">📋 انسخ الكود</button>
+        <button class="btn-view-all-coupons" onclick="closeModal(&#39;payModal&#39;); openMyCoupons()">🎟️ شوف كل كوباناتي</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- MY COUPONS MODAL -->
+<div class="modal-overlay" id="myCouponsModal">
+  <div class="modal my-coupons-modal" style="max-width:540px;">
+    <button class="modal-close" onclick="closeModal(&#39;myCouponsModal&#39;)">✕</button>
+    <h2>🎟️ كوباناتي</h2>
+    <p class="modal-sub">كل الكوبونات اللي اشتريتها</p>
+    <div id="myCouponsList"></div>
+  </div>
+</div>
+
+<!-- TOAST -->
+<div class="toast" id="toast"></div>
+
+<script>
+const API = 'https://forstak-production.up.railway.app';
+const SESSION_KEY = 'forstak_session';
+
+let currentOffer = null;
+let selectedPayMethod = 'فوري';
+let activeCatFilter = 'الكل';
+let currentStep = 1;
+let allOffers = [];
+
+function getSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY)); }
+  catch(e) { return null; }
+}
+
+function saveSession(user) {
+  if (user) localStorage.setItem(SESSION_KEY, JSON.stringify(user));
+  else localStorage.removeItem(SESSION_KEY);
+}
+
+async function renderDeals(filter, search) {
+  filter = filter || 'الكل';
+  search = search || '';
+  const grid = document.getElementById('dealsGrid');
+  const noDeals = document.getElementById('noDeals');
+
+  try {
+    const res = await fetch(API + '/api/offers');
+    allOffers = await res.json();
+  } catch(e) {
+    grid.innerHTML = '<p style="text-align:center;padding:40px;color:#888">جاري تحميل العروض...</p>';
+    return;
+  }
+
+  let filtered = allOffers.filter(function(o){ return o.active !== false; });
+  if (filter !== 'الكل') filtered = filtered.filter(function(o){ return o.category === filter; });
+  if (search.trim()) {
+    var q = search.trim().toLowerCase();
+    filtered = filtered.filter(function(o){
+      return o.title.toLowerCase().includes(q) ||
+        o.category.toLowerCase().includes(q) ||
+        (o.location && o.location.toLowerCase().includes(q));
+    });
+  }
+
+  if (filtered.length === 0) {
+    grid.innerHTML = '';
+    noDeals.style.display = 'block';
+    return;
+  }
+
+  noDeals.style.display = 'none';
+  grid.innerHTML = filtered.map(function(offer) {
+    var discPct = Math.round((1 - offer.priceNew / offer.priceOld) * 100);
+    var stockPct = offer.totalStock > 0 ? Math.round((offer.stock / offer.totalStock) * 100) : 0;
+    var badgeHtml = offer.badge ? '<div class="deal-hot">' + offer.badge + '</div>' : '';
+    var soldOut = offer.stock <= 0;
+    var id = offer._id || offer.id;
+    var buyBtn = soldOut
+      ? '<button class="btn-buy" style="opacity:0.5;cursor:not-allowed;" disabled>نفد الكوبون</button>'
+      : '<button class="btn-buy" onclick="openPayModal(\'' + id + '\')">اشتري الكوبون</button>';
+    return '<div class="deal-card">' +
+      '<div class="deal-img">' + (offer.icon || '🎫') +
+        '<div class="deal-badge">-' + discPct + '%</div>' + badgeHtml +
+      '</div>' +
+      '<div class="deal-body">' +
+        '<div class="deal-category">' + offer.category + '</div>' +
+        '<div class="deal-title">' + offer.title + '</div>' +
+        '<div class="deal-location">📍 ' + (offer.location || '') + '</div>' +
+        '<div class="deal-pricing"><div>' +
+          '<div class="price-new">' + offer.priceNew + ' <span>جنيه</span></div>' +
+          '<div class="price-old">' + offer.priceOld + ' جنيه</div>' +
+        '</div>' + buyBtn + '</div>' +
+        '<div class="deal-remaining"><span>تبقى ' + offer.stock + ' كوبون</span>' +
+          '<div class="remaining-bar"><div class="remaining-fill" style="width:' + stockPct + '%"></div></div>' +
+        '</div>' +
+      '</div></div>';
+  }).join('');
+}
+
+function filterCat(el, cat) {
+  document.querySelectorAll('.cat-card').forEach(function(c){ c.classList.remove('active'); });
+  el.classList.add('active');
+  activeCatFilter = cat;
+  renderDeals(cat, document.getElementById('searchInput').value);
+}
+
+function filterDeals() {
+  renderDeals(activeCatFilter, document.getElementById('searchInput').value);
+}
+
+function openModal(type) {
+  closeAllModals();
+  document.getElementById(type + 'Modal').classList.add('open');
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+}
+
+function closeAllModals() {
+  document.querySelectorAll('.modal-overlay').forEach(function(m){ m.classList.remove('open'); });
+}
+
+document.querySelectorAll('.modal-overlay').forEach(function(el) {
+  el.addEventListener('click', function(e) {
+    if (e.target === this) this.classList.remove('open');
+  });
+});
+
+async function handleLogin() {
+  var phone = document.getElementById('loginPhone').value.trim();
+  var pass = document.getElementById('loginPass').value.trim();
+  if (!phone || !pass) { showToast('من فضلك ادخل رقم موبايلك وكلمة السر'); return; }
+
+  try {
+    var res = await fetch(API + '/api/users/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ phone: phone, password: pass })
+    });
+    if (!res.ok) { showToast('رقم الموبايل او كلمة السر غلط'); return; }
+    var user = await res.json();
+    saveSession(user);
+    closeAllModals();
+    updateNavForUser();
+    showToast('تم تسجيل الدخول بنجاح!');
+  } catch(e) {
+    showToast('حصل خطأ، حاول تاني');
+  }
+}
+
+async function handleRegister() {
+  var name = document.getElementById('regName').value.trim();
+  var phone = document.getElementById('regPhone').value.trim();
+  var pass = document.getElementById('regPass').value.trim();
+  if (!name || !phone || !pass) { showToast('من فضلك اكمل كل البيانات'); return; }
+
+  try {
+    var res = await fetch(API + '/api/users/register', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name: name, phone: phone, password: pass })
+    });
+    if (!res.ok) { showToast('الرقم ده موجود بالفعل، سجّل دخولك'); return; }
+    var user = await res.json();
+    saveSession(user);
+    closeAllModals();
+    updateNavForUser();
+    showToast('تم انشاء حسابك بنجاح! اهلا بيك يا ' + name);
+  } catch(e) {
+    showToast('حصل خطأ، حاول تاني');
+  }
+}
+
+function updateNavForUser() {
+  var session = getSession();
+  var loginBtn = document.getElementById('btnLogin');
+  var regBtn = document.getElementById('btnRegister');
+  var myCouponsBtn = document.getElementById('btnMyCoupons');
+
+  if (session) {
+    loginBtn.style.display = 'none';
+    regBtn.textContent = '👤 ' + session.name;
+    regBtn.onclick = function(){ saveSession(null); updateNavForUser(); showToast('تم تسجيل الخروج'); };
+    myCouponsBtn.classList.add('visible');
+  } else {
+    loginBtn.style.display = '';
+    regBtn.textContent = 'انشئ حساب';
+    regBtn.onclick = function(){ openModal('register'); };
+    myCouponsBtn.classList.remove('visible');
+  }
+}
+
+function openPayModal(offerId) {
+  currentOffer = allOffers.find(function(o){ return (o._id || o.id) === offerId; });
+  if (!currentOffer) return;
+
+  var session = getSession();
+  if (!session) {
+    showToast('سجّل دخولك الأول عشان تشتري الكوبون');
+    openModal('login');
+    return;
+  }
+
+  var save = currentOffer.priceOld - currentOffer.priceNew;
+  document.getElementById('dealSummaryBox').innerHTML =
+    '<div class="deal-summary-icon">' + (currentOffer.icon || '🎫') + '</div>' +
+    '<div class="deal-summary-info"><h3>' + currentOffer.title + '</h3>' +
+    '<div class="price-row">' +
+      '<span class="new-p">' + currentOffer.priceNew + ' جنيه</span>' +
+      '<span class="old-p">' + currentOffer.priceOld + ' جنيه</span>' +
+      '<span class="save-p">وفّر ' + save + ' جنيه</span>' +
+    '</div></div>';
+
+  document.getElementById('payTotalAmount').textContent = currentOffer.priceNew + ' جنيه';
+  goToPayStep(1);
+  document.getElementById('payModal').classList.add('open');
+}
+
+function goToPayStep(step) {
+  currentStep = step;
+  [1, 2, 3].forEach(function(i) {
+    document.getElementById('payStep' + i).classList.toggle('active', i === step);
+    var pstep = document.getElementById('pstep' + i);
+    pstep.classList.remove('active', 'done');
+    if (i < step) pstep.classList.add('done');
+    else if (i === step) pstep.classList.add('active');
+  });
+}
+
+function selectMethod(el) {
+  document.querySelectorAll('.pay-method').forEach(function(m){ m.classList.remove('selected'); });
+  el.classList.add('selected');
+  selectedPayMethod = el.dataset.method;
+  document.getElementById('cardFields').style.display =
+    selectedPayMethod === 'فيزا / ماستر كارد' ? 'block' : 'none';
+}
+
+function processPayment() {
+  var btn = document.getElementById('btnPay');
+  btn.textContent = 'جاري الدفع...';
+  btn.disabled = true;
+  setTimeout(function() {
+    btn.textContent = 'ادفع دلوقتي';
+    btn.disabled = false;
+    completePurchase();
+  }, 1800);
+}
+
+async function completePurchase() {
+  var session = getSession();
+  var code = generateCouponCode();
+  var now = new Date();
+  var expiry = new Date(now);
+  expiry.setDate(expiry.getDate() + 30);
+
+  var coupon = {
+    code: code,
+    offerId: currentOffer._id || currentOffer.id,
+    offerTitle: currentOffer.title,
+    offerIcon: currentOffer.icon || '🎫',
+    category: currentOffer.category,
+    priceNew: currentOffer.priceNew,
+    priceOld: currentOffer.priceOld,
+    payMethod: selectedPayMethod,
+    userId: session._id || session.id,
+    userName: session.name,
+    userPhone: session.phone,
+    buyDate: now.toISOString(),
+    expiryDate: expiry.toISOString(),
+    status: 'صالح'
+  };
+
+  try {
+    await fetch(API + '/api/coupons', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(coupon)
+    });
+  } catch(e) {}
+
+  document.getElementById('generatedCode').textContent = code;
+  document.getElementById('couponDealName').textContent = currentOffer.title;
+  document.getElementById('couponBuyDate').textContent = formatDate(now);
+  document.getElementById('couponExpiry').textContent = formatDate(expiry);
+
+  goToPayStep(3);
+  renderDeals(activeCatFilter, document.getElementById('searchInput').value);
+}
+
+function generateCouponCode() {
+  var chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  var rand = function(n) {
+    return Array.from({length: n}, function(){ return chars[Math.floor(Math.random() * chars.length)]; }).join('');
+  };
+  return 'FSK-' + rand(4) + '-' + rand(2);
+}
+
+function formatDate(d) {
+  return d.toLocaleDateString('ar-EG', { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+function copyCode() {
+  var code = document.getElementById('generatedCode').textContent;
+  navigator.clipboard.writeText(code).catch(function(){});
+  showToast('تم نسخ الكود: ' + code);
+}
+
+async function openMyCoupons() {
+  var session = getSession();
+  if (!session) { openModal('login'); return; }
+
+  var list = document.getElementById('myCouponsList');
+  list.innerHTML = '<p style="text-align:center;padding:20px">جاري التحميل...</p>';
+  document.getElementById('myCouponsModal').classList.add('open');
+
+  try {
+    var res = await fetch(API + '/api/coupons/user/' + (session._id || session.id));
+    var coupons = await res.json();
+
+    if (coupons.length === 0) {
+      list.innerHTML = '<div class="empty-coupons"><div class="empty-icon">🎫</div><p>مش عندك كوبونات لسه<br><strong>ابدأ اشتري من العروض المتاحة!</strong></p></div>';
+    } else {
+      list.innerHTML = coupons.slice().reverse().map(function(c) {
+        var expDate = new Date(c.expiryDate);
+        var isExpired = expDate < new Date();
+        var statusClass = c.status === 'مُستخدم' ? 'status-used' : (isExpired ? 'status-used' : 'status-valid');
+        var statusText = c.status === 'مُستخدم' ? 'مُستخدم' : (isExpired ? 'منتهي' : 'صالح');
+        return '<div class="my-coupon-item">' +
+          '<div class="my-coupon-header">' +
+            '<span class="my-coupon-code">' + c.code + '</span>' +
+            '<span class="my-coupon-status ' + statusClass + '">' + statusText + '</span>' +
+          '</div>' +
+          '<div class="my-coupon-body">' +
+            '<div class="my-coupon-title">' + c.offerIcon + ' ' + c.offerTitle + '</div>' +
+            '<div class="my-coupon-meta">' +
+              '<span>💰 ' + c.priceNew + ' جنيه</span>' +
+              '<span>📅 ينتهي ' + formatDate(expDate) + '</span>' +
+              '<span>💳 ' + c.payMethod + '</span>' +
+            '</div>' +
+          '</div></div>';
+      }).join('');
+    }
+  } catch(e) {
+    list.innerHTML = '<p style="text-align:center;padding:20px;color:#888">تعذر تحميل الكوبونات</p>';
+  }
+}
+
+function showToast(msg) {
+  var t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(function(){ t.classList.remove('show'); }, 3000);
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  renderDeals();
+  updateNavForUser();
+});
+</script>
+
+
+</body></html>
